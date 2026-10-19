@@ -19,6 +19,10 @@ private final class FakeEngine: MattingEngine, @unchecked Sendable {
     private var _blocked = 0
     private let gate = NSCondition()
     var alphaToReturn = [Float](repeating: 0, count: 512)
+    /// When true the worker encodes on its own thread and steps on the
+    /// stepper, as with the Core ML engine's split placement.
+    var overlaps = false
+    var supportsOverlap: Bool { overlaps }
 
     var resets: Int { lock.withLock { _resets } }
     var seeds: [[Float]] { lock.withLock { _seeds } }
@@ -117,11 +121,12 @@ private struct Harness {
     }
 
     init(
-        options: WorkerOptions = Harness.defaultOptions,
+        options: WorkerOptions = Harness.defaultOptions, overlap: Bool = false,
         prepareStore: ((CalibrationStore) throws -> Void)? = nil
     )
         throws
     {
+        engine.overlaps = overlap
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("obs-matanyone2-worker-\(UUID().uuidString)")
         store = CalibrationStore(directory: dir)
@@ -365,6 +370,50 @@ private struct Harness {
         #expect(h.worker.pollMatte() == nil || h.worker.pollMatte()?.frameID != matte?.frameID)
         #expect(h.wait { h.worker.lastHandledFrameID == 90_109 })
         #expect(h.wait { h.worker.status().droppedFrames >= 8 })
+    }
+
+    @Test func overlappedTrackingPublishesTheMatteOfItsOwnFrame() throws {
+        let h = try Harness(overlap: true)
+        defer { h.stop() }
+        #expect(h.waitForPhase(.uncalibrated))
+        #expect(h.calibrate())
+        h.segmenter.mask = Harness.person
+        h.engine.alphaToReturn = (0..<512).map { ($0 % 32) < 12 ? 1 : 0 }
+        h.worker.request(.seed)
+        #expect(h.waitForPhase(.tracking))
+        h.submit(id: 90_200)
+        var matte: MatteResult?
+        #expect(
+            h.wait {
+                matte = h.worker.pollMatte() ?? matte
+                return matte?.frameID == 90_200
+            })
+        #expect(matte?.alpha[0] == 255)
+        #expect(matte?.alpha[31] == 0)
+    }
+
+    @Test func reseedDropsAnOverlappedStepStillInFlight() throws {
+        let h = try Harness(overlap: true)
+        defer { h.stop() }
+        #expect(h.waitForPhase(.uncalibrated))
+        #expect(h.calibrate())
+        h.segmenter.mask = Harness.person
+        h.worker.request(.seed)
+        #expect(h.waitForPhase(.tracking))
+        let seedsBefore = h.engine.seeds.count
+        // The stepper is inside frame 90_300's step when the re-seed arrives;
+        // the re-seed waits for it, and its matte belongs to the old memory.
+        h.engine.hold()
+        h.submit(id: 90_300)
+        #expect(h.wait { h.engine.blockedSteps == 1 })
+        h.worker.request(.reseed)
+        Thread.sleep(forTimeInterval: 0.05)
+        #expect(h.engine.seeds.count == seedsBefore)
+        h.engine.release()
+        #expect(h.wait { h.engine.seeds.count > seedsBefore })
+        #expect(h.waitForPhase(.tracking))
+        Thread.sleep(forTimeInterval: 0.05)
+        #expect(h.worker.pollMatte()?.frameID != 90_300)
     }
 
     @Test func periodicReseedUsesTrackedProps() throws {

@@ -18,11 +18,13 @@ typedef void *ma2_context_t;
 
 typedef void (*ma2_log_fn)(void *user, const char *message);
 
-/* 0 = CPU + Neural Engine, 1 = CPU + GPU, 2 = all. */
+/* 0 = CPU + Neural Engine, 1 = CPU + GPU, 2 = all,
+ * 3 = split (decoder on the GPU, the rest on the Neural Engine, frames overlap). */
 enum ma2_compute_units {
     MA2_COMPUTE_CPU_ANE = 0,
     MA2_COMPUTE_CPU_GPU = 1,
     MA2_COMPUTE_ALL = 2,
+    MA2_COMPUTE_SPLIT = 3,
 };
 
 typedef struct ma2_create_options {

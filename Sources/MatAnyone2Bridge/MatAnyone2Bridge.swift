@@ -66,10 +66,11 @@ private func context(_ pointer: UnsafeMutableRawPointer?) -> BridgeContext? {
     pointer.map { Unmanaged<BridgeContext>.fromOpaque($0).takeUnretainedValue() }
 }
 
-func computeUnits(_ raw: Int32) -> MLComputeUnits {
+func computeUnits(_ raw: Int32) -> EnginePlacement {
     switch raw {
     case Int32(MA2_COMPUTE_CPU_GPU.rawValue): return .cpuAndGPU
     case Int32(MA2_COMPUTE_ALL.rawValue): return .all
+    case Int32(MA2_COMPUTE_SPLIT.rawValue): return .split
     default: return .cpuAndNeuralEngine
     }
 }

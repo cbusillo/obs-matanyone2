@@ -28,7 +28,7 @@ public enum WorkerRequest: Sendable {
     case seed
     case reseed
     case clear
-    case setComputeUnits(MLComputeUnits)
+    case setComputeUnits(EnginePlacement)
 }
 
 /// One finished matte. `alpha` shares storage with the worker's rotating
@@ -55,9 +55,9 @@ public struct SystemClock: WorkerClock {
 }
 
 public struct EngineFactory: Sendable {
-    public let make: @Sendable (URL, MLComputeUnits) throws -> any MattingEngine
+    public let make: @Sendable (URL, EnginePlacement) throws -> any MattingEngine
 
-    public init(make: @escaping @Sendable (URL, MLComputeUnits) throws -> any MattingEngine) {
+    public init(make: @escaping @Sendable (URL, EnginePlacement) throws -> any MattingEngine) {
         self.make = make
     }
 

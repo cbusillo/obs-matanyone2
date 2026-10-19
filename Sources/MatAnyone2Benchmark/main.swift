@@ -20,8 +20,11 @@ struct Arguments {
     var calibrationDirectory: URL?
     var captureOnly = false
     var duration = 60.0
-    var computeUnits = MLComputeUnits.cpuAndNeuralEngine
+    var computeUnits = EnginePlacement.cpuAndNeuralEngine
     var device = "Elgato 4K X"
+    /// Replay this video at 30 fps instead of capturing, looping until the
+    /// duration ends.
+    var video: URL?
 
     static func parse(_ args: [String]) -> Arguments {
         var result = Arguments()
@@ -42,11 +45,13 @@ struct Arguments {
                 guard let seconds = Double(value()) else { usage() }
                 result.duration = seconds
             case "--device": result.device = value()
+            case "--video": result.video = URL(fileURLWithPath: value())
             case "--compute-units":
                 switch value() {
                 case "cpu_ane": result.computeUnits = .cpuAndNeuralEngine
                 case "cpu_gpu": result.computeUnits = .cpuAndGPU
                 case "all": result.computeUnits = .all
+                case "split": result.computeUnits = .split
                 default: usage()
                 }
             default: usage()
@@ -62,7 +67,7 @@ struct Arguments {
                 """
                 usage: matanyone2-benchmark [--models DIR] [--calibration DIR] [--capture-only]
                                             [--duration SECONDS] [--compute-units cpu_ane|cpu_gpu|all]
-                                            [--device NAME]
+                                            [--device NAME] [--video FILE]
 
                 """.utf8))
         exit(2)
@@ -106,6 +111,11 @@ final class CameraDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         from connection: AVCaptureConnection
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        handle(pixelBuffer)
+    }
+
+    /// One BGRA frame from the camera or the replayed video.
+    func handle(_ pixelBuffer: CVPixelBuffer) {
         statistics.with { $0.captured += 1 }
         guard let worker else { return }
         frameID += 1
@@ -158,6 +168,43 @@ final class CameraDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         from connection: AVCaptureConnection
     ) {
         statistics.with { $0.dropped += 1 }
+    }
+}
+
+/// Decodes `url` to BGRA and hands frames to `delegate` at 30 fps, looping,
+/// for `seconds` of wall time. The pacing is absolute, so a slow frame does
+/// not slow the clip; frames are never queued.
+func replay(_ url: URL, into delegate: CameraDelegate, until seconds: Double) {
+    let start = DispatchTime.now().uptimeNanoseconds
+    let interval: UInt64 = 1_000_000_000 / 30
+    var index: UInt64 = 0
+    let asset = AVURLAsset(url: url)
+    while Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9 < seconds {
+        let semaphore = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var track: AVAssetTrack?
+        Task {
+            track = try? await asset.loadTracks(withMediaType: .video).first
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let track, let reader = try? AVAssetReader(asset: asset) else {
+            fail("cannot read \(url.path)")
+        }
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        reader.add(output)
+        reader.startReading()
+        while let sample = output.copyNextSampleBuffer() {
+            let due = start + index * interval
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now < due { Thread.sleep(forTimeInterval: Double(due - now) / 1e9) }
+            index += 1
+            if Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9 >= seconds { return }
+            if let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
+                delegate.handle(pixelBuffer)
+            }
+        }
     }
 }
 
@@ -241,7 +288,7 @@ func configureCamera(name: String, delegate: CameraDelegate) throws -> AVCapture
 // MARK: - main
 
 let arguments = Arguments.parse(Array(CommandLine.arguments.dropFirst()))
-ensureCameraAuthorization()
+if arguments.video == nil { ensureCameraAuthorization() }
 
 let statistics = Statistics()
 var worker: MattingWorker?
@@ -265,13 +312,21 @@ if !arguments.captureOnly {
     created.start()
     worker = created
     print(
-        "Models: \(arguments.modelsDirectory.path) (\(manifest.workingWidth)x\(manifest.workingHeight)), compute units: \(arguments.computeUnits.rawValue)"
+        "Models: \(arguments.modelsDirectory.path) (\(manifest.workingWidth)x\(manifest.workingHeight)), compute units: \(arguments.computeUnits)"
     )
 }
 
 let delegate = CameraDelegate(worker: worker, statistics: statistics)
-let session = try configureCamera(name: arguments.device, delegate: delegate)
-session.startRunning()
+var session: AVCaptureSession?
+if let video = arguments.video {
+    let feeder = Thread { replay(video, into: delegate, until: arguments.duration) }
+    feeder.qualityOfService = .userInteractive
+    feeder.start()
+    print("Replaying \(video.lastPathComponent) at 30 fps")
+} else {
+    session = try configureCamera(name: arguments.device, delegate: delegate)
+    session?.startRunning()
+}
 print(
     arguments.captureOnly
         ? "Capture-only run for \(Int(arguments.duration)) s."
@@ -319,7 +374,7 @@ while Date().timeIntervalSince(statistics.startedAt) < arguments.duration {
     fflush(stdout)
 }
 
-session.stopRunning()
+session?.stopRunning()
 let total = statistics.with {
     ($0.captured, $0.dropped, $0.mattes, $0.endToEnd.p50, $0.endToEnd.p95)
 }

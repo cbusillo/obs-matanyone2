@@ -29,7 +29,7 @@ public final class MattingWorker: @unchecked Sendable {
     private var poolHeight = 0
     private var requests: [WorkerRequest] = []
     private var options: WorkerOptions
-    private var computeUnits: MLComputeUnits
+    private var computeUnits: EnginePlacement
     private var stopping = false
     private var started = false
     private var publishedMatte: MatteResult?
@@ -44,6 +44,31 @@ public final class MattingWorker: @unchecked Sendable {
     private var overlayBytes: [UInt8] = []
     private var overlayVersion: UInt32 = 0
     private var overlayStatusLine = false
+    // Overlap, for engines that support it: the worker encodes frame N+1
+    // while the stepper thread runs the rest of frame N. The stepper touches
+    // only the engine's step; the worker waits for it to go idle
+    // (`quiesceStepper`) before seeding, resetting or reloading the engine.
+    private var stepJob: StepJob?
+    private var stepResult: StepResult?
+    private var stepperBusy = false
+    private var stepGeneration: UInt64 = 0
+    private var stepper: Thread?
+
+    private struct StepJob {
+        let engine: any MattingEngine
+        let encoded: EncodedFrame
+        let frameID: UInt64
+        let captureNs: UInt64
+        let encodeStartNs: UInt64
+        let preprocessMs: Double
+        let generation: UInt64
+    }
+
+    private struct StepResult {
+        let job: StepJob
+        let alpha: Result<[Float], any Error>
+        let doneNs: UInt64
+    }
 
     // worker-only
     private var thread: Thread?
@@ -85,7 +110,7 @@ public final class MattingWorker: @unchecked Sendable {
 
     public init(
         modelsDirectory: URL, workingWidth: Int, workingHeight: Int,
-        calibrationStore: CalibrationStore, computeUnits: MLComputeUnits,
+        calibrationStore: CalibrationStore, computeUnits: EnginePlacement,
         options: WorkerOptions, engineFactory: EngineFactory, segmenter: any PersonSegmenter,
         clock: any WorkerClock = SystemClock(), log: @escaping @Sendable (String) -> Void
     ) {
@@ -125,7 +150,13 @@ public final class MattingWorker: @unchecked Sendable {
         thread.qualityOfService = .userInteractive
         thread.stackSize = 4 << 20
         self.thread = thread
+        let stepper = Thread { [self] in runStepper() }
+        stepper.name = "obs-matanyone2.stepper"
+        stepper.qualityOfService = .userInteractive
+        stepper.stackSize = 4 << 20
+        self.stepper = stepper
         thread.start()
+        stepper.start()
     }
 
     /// Stops the worker and waits for it to exit.
@@ -135,6 +166,9 @@ public final class MattingWorker: @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
         while let thread, !thread.isFinished {
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        while let stepper, !stepper.isFinished {
             Thread.sleep(forTimeInterval: 0.002)
         }
     }
@@ -173,7 +207,7 @@ public final class MattingWorker: @unchecked Sendable {
             pool?.give(replaced)
         }
         pending = buffer
-        condition.signal()
+        condition.broadcast()  // the worker and the stepper both wait on it
         condition.unlock()
         return true
     }
@@ -190,14 +224,14 @@ public final class MattingWorker: @unchecked Sendable {
     public func request(_ request: WorkerRequest) {
         condition.lock()
         requests.append(request)
-        condition.signal()
+        condition.broadcast()  // the worker and the stepper both wait on it
         condition.unlock()
     }
 
     public func setOptions(_ newOptions: WorkerOptions) {
         condition.lock()
         options = newOptions
-        condition.signal()
+        condition.broadcast()  // the worker and the stepper both wait on it
         condition.unlock()
     }
 
@@ -265,10 +299,12 @@ public final class MattingWorker: @unchecked Sendable {
     /// frame and timers. Returns false once the worker is asked to stop.
     private func runOnce() -> Bool {
         condition.lock()
-        while !stopping && pending == nil && requests.isEmpty && !hasDeadline() {
+        while !stopping && pending == nil && requests.isEmpty && stepResult == nil
+            && !hasDeadline()
+        {
             condition.wait()
         }
-        if !stopping && pending == nil && requests.isEmpty {
+        if !stopping && pending == nil && requests.isEmpty && stepResult == nil {
             // A deadline is pending: sleep in short steps so an injected
             // clock advanced by a test is noticed promptly.
             condition.wait(until: Date(timeIntervalSinceNow: min(0.05, secondsToDeadline())))
@@ -284,10 +320,15 @@ public final class MattingWorker: @unchecked Sendable {
         pending = nil
         let queued = requests
         requests.removeAll()
+        let finished = stepResult
+        stepResult = nil
         let currentOptions = options
         condition.unlock()
 
         postprocessor.options = currentOptions.postprocess
+        if let finished {
+            finishStep(finished, options: currentOptions)
+        }
         for request in queued {
             handle(request, options: currentOptions)
         }
@@ -349,7 +390,9 @@ public final class MattingWorker: @unchecked Sendable {
             if let data = try store.load(workingWidth: workingWidth, workingHeight: workingHeight) {
                 calibration = data
                 if let keep = data.keepMask {
-                    log(String(format: "keep mask loaded: %.1f%% of the frame", keep.coverage * 100))
+                    log(
+                        String(format: "keep mask loaded: %.1f%% of the frame", keep.coverage * 100)
+                    )
                 }
                 if data.propsMask != nil {
                     log("calibration loaded (\(data.propsRegions) prop regions)")
@@ -484,6 +527,7 @@ public final class MattingWorker: @unchecked Sendable {
     /// and `frame` with `mask` is added as a second memory frame. Without a
     /// plate, `frame` with `mask` is the seed. Returns a label for the log.
     private func plant(engine: any MattingEngine, frame: FrameBuffer, mask: Mask) throws -> String {
+        quiesceStepper()
         engine.reset()
         if let plate = calibration.propsPlate, let props = calibration.propsMask,
             plate.width == frame.width, plate.height == frame.height
@@ -503,14 +547,17 @@ public final class MattingWorker: @unchecked Sendable {
     private func clearCalibration() {
         do { try store.clear() } catch { log("could not delete calibration: \(error)") }
         calibration = CalibrationData()
-        calibration.keepMask = store.loadKeepMask(workingWidth: workingWidth, workingHeight: workingHeight)
+        calibration.keepMask = store.loadKeepMask(
+            workingWidth: workingWidth, workingHeight: workingHeight)
         accumulator = nil
         lastRawAlpha = nil
+        quiesceStepper()
         engine?.reset()
         transition(to: .uncalibrated)
     }
 
-    private func reloadModels(_ units: MLComputeUnits) {
+    private func reloadModels(_ units: EnginePlacement) {
+        quiesceStepper()
         condition.lock()
         computeUnits = units
         condition.unlock()
@@ -637,13 +684,103 @@ public final class MattingWorker: @unchecked Sendable {
         let t0 = clock.nowNs()
         preprocessor.rgbPlanar(from: frame, into: &imageTensor)
         let t1 = clock.nowNs()
-        var alpha: [Float]
+
+        if engine.supportsOverlap {
+            // Encode here, step on the stepper: the next frame's encoder then
+            // runs while this frame finishes. A newer frame replaces one the
+            // stepper has not started, counted as a drop.
+            let encoded: EncodedFrame
+            do {
+                encoded = try engine.encode(image: imageTensor)
+            } catch {
+                fail("Inference failed: \(error)", resume: .tracking)
+                return
+            }
+            condition.lock()
+            if stepJob != nil && countDrops { droppedFrames += 1 }
+            stepJob = StepJob(
+                engine: engine, encoded: encoded, frameID: frame.frameID,
+                captureNs: frame.captureNs, encodeStartNs: t1,
+                preprocessMs: Double(t1 - t0) / 1e6, generation: stepGeneration)
+            condition.broadcast()
+            condition.unlock()
+            return
+        }
+
+        let alpha: [Float]
         do {
             alpha = try engine.step(image: imageTensor)
         } catch {
             fail("Inference failed: \(error)", resume: .tracking)
             return
         }
+        finishMatte(
+            alpha, frameID: frame.frameID, captureNs: frame.captureNs,
+            preprocessMs: Double(t1 - t0) / 1e6, inferenceMs: Double(clock.nowNs() - t1) / 1e6,
+            options: options)
+    }
+
+    /// A step the stepper finished: published unless the tracker was reseeded,
+    /// reset or left tracking since the frame was encoded.
+    private func finishStep(_ result: StepResult, options: WorkerOptions) {
+        condition.lock()
+        let current = result.job.generation == stepGeneration
+        condition.unlock()
+        guard current, phase == .tracking else { return }
+        switch result.alpha {
+        case .failure(let error):
+            fail("Inference failed: \(error)", resume: .tracking)
+        case .success(let alpha):
+            finishMatte(
+                alpha, frameID: result.job.frameID, captureNs: result.job.captureNs,
+                preprocessMs: result.job.preprocessMs,
+                inferenceMs: Double(result.doneNs &- result.job.encodeStartNs) / 1e6,
+                options: options)
+        }
+    }
+
+    /// The stepper thread: runs queued steps one at a time, in order.
+    private func runStepper() {
+        while true {
+            condition.lock()
+            while !stopping && stepJob == nil { condition.wait() }
+            guard !stopping, let job = stepJob else {
+                condition.unlock()
+                return
+            }
+            stepJob = nil
+            stepperBusy = true
+            condition.unlock()
+            let alpha = autoreleasepool {
+                Result<[Float], any Error> { try job.engine.step(encoded: job.encoded) }
+            }
+            let done = clock.nowNs()
+            condition.lock()
+            stepperBusy = false
+            if job.generation == stepGeneration {
+                stepResult = StepResult(job: job, alpha: alpha, doneNs: done)
+            }
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
+    /// Waits until the stepper holds no step and drops queued and finished
+    /// ones, so the worker may touch the engine. Worker thread only.
+    private func quiesceStepper() {
+        condition.lock()
+        stepGeneration &+= 1
+        stepJob = nil
+        while stepperBusy { condition.wait() }
+        stepResult = nil
+        condition.unlock()
+    }
+
+    private func finishMatte(
+        _ raw: [Float], frameID: UInt64, captureNs: UInt64, preprocessMs: Double,
+        inferenceMs: Double, options: WorkerOptions
+    ) {
+        var alpha = raw
         let t2 = clock.nowNs()
         lastRawAlpha = alpha
         if let keep = calibration.keepMask, keep.pixels.count == alpha.count {
@@ -655,15 +792,15 @@ public final class MattingWorker: @unchecked Sendable {
         postprocessor.process(alpha: &alpha, into: &matteBuffers[matteIndex])
         let t3 = clock.nowNs()
 
-        preprocessStats.add(Double(t1 - t0) / 1e6)
-        inferenceStats.add(Double(t2 - t1) / 1e6)
+        preprocessStats.add(preprocessMs)
+        inferenceStats.add(inferenceMs)
         postprocessStats.add(Double(t3 - t2) / 1e6)
         predictions += 1
         countFPS(at: t3)
 
         let result = MatteResult(
             alpha: matteBuffers[matteIndex], width: workingWidth, height: workingHeight,
-            frameID: frame.frameID, captureNs: frame.captureNs, readyNs: t3)
+            frameID: frameID, captureNs: captureNs, readyNs: t3)
         condition.lock()
         publishedMatte = result
         condition.unlock()

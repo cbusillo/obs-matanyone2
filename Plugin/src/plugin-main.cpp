@@ -53,6 +53,8 @@ int compute_units_from_string(const char *value) {
         return MA2_COMPUTE_CPU_GPU;
     if (std::strcmp(value, "all") == 0)
         return MA2_COMPUTE_ALL;
+    if (std::strcmp(value, "split") == 0)
+        return MA2_COMPUTE_SPLIT;
     return MA2_COMPUTE_CPU_ANE;
 }
 
@@ -305,6 +307,7 @@ obs_properties_t *filter_properties(void *data) {
     obs_property_list_add_string(p, T("ComputeUnits.CpuAne"), "cpu_ane");
     obs_property_list_add_string(p, T("ComputeUnits.CpuGpu"), "cpu_gpu");
     obs_property_list_add_string(p, T("ComputeUnits.All"), "all");
+    obs_property_list_add_string(p, T("ComputeUnits.Split"), "split");
     describe(p, "ComputeUnits.Description");
     p = obs_properties_add_int_slider(performance, "max_matte_fps", T("MaxMatteFps"), 0, 60, 1);
     obs_property_int_set_suffix(p, " fps");

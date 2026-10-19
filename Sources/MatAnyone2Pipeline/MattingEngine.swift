@@ -17,6 +17,32 @@ public protocol MattingEngine: AnyObject {
     /// Adds a second frame with a known mask to the memory after `seed`.
     func addMemoryFrame(image: [Float], mask: [Float]) throws
     func step(image: [Float]) throws -> [Float]
+
+    /// True when `encode` may run on one thread while `step(encoded:)` runs
+    /// on another, so the worker can overlap frame N+1's encoder with the
+    /// rest of frame N. Engines that cannot overlap keep the defaults below.
+    var supportsOverlap: Bool { get }
+    /// Runs the part of a step that reads no tracker state.
+    func encode(image: [Float]) throws -> EncodedFrame
+    /// The rest of `step(image:)` for a frame from `encode(image:)`. Steps
+    /// still run one at a time and in frame order.
+    func step(encoded: EncodedFrame) throws -> [Float]
+}
+
+/// One frame's encoder output, opaque to the worker.
+public struct EncodedFrame: @unchecked Sendable {
+    let payload: Any
+}
+
+extension MattingEngine {
+    public var supportsOverlap: Bool { false }
+    public func encode(image: [Float]) throws -> EncodedFrame { EncodedFrame(payload: image) }
+    public func step(encoded: EncodedFrame) throws -> [Float] {
+        guard let image = encoded.payload as? [Float] else {
+            throw EngineError.prediction("encoded frame from another engine")
+        }
+        return try step(image: image)
+    }
 }
 
 public enum EngineError: Error, CustomStringConvertible {
@@ -31,19 +57,59 @@ public enum EngineError: Error, CustomStringConvertible {
     }
 }
 
+/// Where Core ML runs the six models.
+public enum EnginePlacement: Equatable, Sendable {
+    /// Every model on the same units (the object summary always on the GPU,
+    /// which the Neural Engine compiler rejects).
+    case uniform(MLComputeUnits)
+    /// The encoder, uncertainty, readout and mask encoder on the Neural
+    /// Engine and the decoder on the GPU, with frame N+1's encoder
+    /// overlapping the rest of frame N. At 896x512 on an M4 Max this keeps
+    /// each unit under a 30 fps frame, which no uniform placement does.
+    case split
+
+    public static let cpuAndNeuralEngine = EnginePlacement.uniform(.cpuAndNeuralEngine)
+    public static let cpuAndGPU = EnginePlacement.uniform(.cpuAndGPU)
+    public static let all = EnginePlacement.uniform(.all)
+}
+
+extension EnginePlacement: CustomStringConvertible {
+    /// The setting's value as the plugin and the benchmark spell it.
+    public var description: String {
+        switch self {
+        case .split: return "split"
+        case .uniform(.cpuAndGPU): return "cpu_gpu"
+        case .uniform(.all): return "all"
+        case .uniform(.cpuAndNeuralEngine): return "cpu_ane"
+        case .uniform(let other): return "units(\(other.rawValue))"
+        }
+    }
+}
+
 /// MatAnyone2Kit engine driven directly, bypassing the kit's Vision seeding.
 public final class CoreMLMattingEngine: MattingEngine {
     private let engine: MatAnyoneCoreMLEngine
     public let workingWidth: Int
     public let workingHeight: Int
 
-    public init(modelsDirectory: URL, computeUnits: MLComputeUnits) throws {
+    public let supportsOverlap: Bool
+
+    public init(modelsDirectory: URL, computeUnits placement: EnginePlacement) throws {
         // objsummary is rank-5 matmul/reduce that the ANE compiler rejects; the
         // kit pins it to the GPU and runs it only on memory frames.
+        let units: MLComputeUnits
+        var overrides: [String: MLComputeUnits] = ["objsummary": .cpuAndGPU]
+        switch placement {
+        case .uniform(let all):
+            units = all
+        case .split:
+            units = .cpuAndNeuralEngine
+            overrides["decoder"] = .cpuAndGPU
+        }
         let model = try MatAnyoneCoreML(
-            modelsDir: modelsDirectory, computeUnits: computeUnits,
-            unitOverrides: ["objsummary": .cpuAndGPU])
+            modelsDir: modelsDirectory, computeUnits: units, unitOverrides: overrides)
         engine = MatAnyoneCoreMLEngine(model: model)
+        supportsOverlap = placement == .split
         workingWidth = engine.W
         workingHeight = engine.H
     }
@@ -73,6 +139,25 @@ public final class CoreMLMattingEngine: MattingEngine {
             alpha = try engine.step(
                 image: .init(data: image, shape: [1, 3, workingHeight, workingWidth]))
         }
+        return alpha
+    }
+
+    public func encode(image: [Float]) throws -> EncodedFrame {
+        var encoded: MatAnyoneCoreMLEngine.Encoded?
+        try guarded("encode") { [self] in
+            encoded = try engine.encode(
+                image: .init(data: image, shape: [1, 3, workingHeight, workingWidth]))
+        }
+        guard let encoded else { throw EngineError.prediction("encode returned nothing") }
+        return EncodedFrame(payload: encoded)
+    }
+
+    public func step(encoded: EncodedFrame) throws -> [Float] {
+        guard let frame = encoded.payload as? MatAnyoneCoreMLEngine.Encoded else {
+            throw EngineError.prediction("encoded frame from another engine")
+        }
+        var alpha: [Float] = []
+        try guarded("step") { [self] in alpha = try engine.step(encoded: frame) }
         return alpha
     }
 

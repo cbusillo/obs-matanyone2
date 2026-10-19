@@ -1,12 +1,12 @@
 {
-  "originHash" : "dcf2e20c7b17683446bc5afcc47ea9cb0c7af523ba787116ae7e9cd52a0b534e",
+  "originHash" : "5628da20b46043dbaff527ca5b45dea1b041456ee6e9f74ade866d715af291d6",
   "pins" : [
     {
       "identity" : "matanyone2kit",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/xy13m/MatAnyone2Kit",
+      "location" : "https://github.com/cbusillo/MatAnyone2Kit",
       "state" : {
-        "revision" : "34cd1db78662e3ae9fe435f1ba2b374239271e2e"
+        "revision" : "e764eaf451f87fae8743035681bff57ebf4f998e"
       }
     }
   ],

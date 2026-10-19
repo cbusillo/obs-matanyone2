@@ -15,11 +15,13 @@ let package = Package(
         .executable(name: "matanyone2-benchmark", targets: ["MatAnyone2Benchmark"]),
     ],
     dependencies: [
-        // Fork of github.com/flowtyone/MatAnyone2Kit. Pinned by revision; bump it
-        // whenever the fork gains a commit the plugin needs.
+        // The owner's fork of xy13m/MatAnyone2Kit (itself a fork of
+        // flowtyone/MatAnyone2Kit), adding encode/step(encoded:) so frames can
+        // overlap. Pinned by revision; bump it whenever the fork gains a commit
+        // the plugin needs.
         .package(
-            url: "https://github.com/xy13m/MatAnyone2Kit",
-            revision: "34cd1db78662e3ae9fe435f1ba2b374239271e2e"
+            url: "https://github.com/cbusillo/MatAnyone2Kit",
+            revision: "e764eaf451f87fae8743035681bff57ebf4f998e"
         )
     ],
     targets: [
