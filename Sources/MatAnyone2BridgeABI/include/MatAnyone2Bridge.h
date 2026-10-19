@@ -41,6 +41,7 @@ typedef struct ma2_options {
     int32_t max_matte_fps;           /* 0 = unlimited */
     float edge_offset_px;            /* negative erodes, positive feathers */
     float temporal_smoothing;        /* 0-0.9 weight of the previous matte */
+    float alpha_hardness;            /* 0 = off, 1 = nearly binary matte */
     bool speck_filter;
     bool verbose_logging;
 } ma2_options;

@@ -348,6 +348,9 @@ public final class MattingWorker: @unchecked Sendable {
         do {
             if let data = try store.load(workingWidth: workingWidth, workingHeight: workingHeight) {
                 calibration = data
+                if let keep = data.keepMask {
+                    log(String(format: "keep mask loaded: %.1f%% of the frame", keep.coverage * 100))
+                }
                 if data.propsMask != nil {
                     log("calibration loaded (\(data.propsRegions) prop regions)")
                     transition(to: .waitingForPerson)
@@ -500,6 +503,7 @@ public final class MattingWorker: @unchecked Sendable {
     private func clearCalibration() {
         do { try store.clear() } catch { log("could not delete calibration: \(error)") }
         calibration = CalibrationData()
+        calibration.keepMask = store.loadKeepMask(workingWidth: workingWidth, workingHeight: workingHeight)
         accumulator = nil
         lastRawAlpha = nil
         engine?.reset()
@@ -642,6 +646,11 @@ public final class MattingWorker: @unchecked Sendable {
         }
         let t2 = clock.nowNs()
         lastRawAlpha = alpha
+        if let keep = calibration.keepMask, keep.pixels.count == alpha.count {
+            for i in 0..<alpha.count where keep.pixels[i] != 0 {
+                alpha[i] = max(alpha[i], Float(keep.pixels[i]) / 255)
+            }
+        }
         matteIndex = (matteIndex + 1) % matteBuffers.count
         postprocessor.process(alpha: &alpha, into: &matteBuffers[matteIndex])
         let t3 = clock.nowNs()

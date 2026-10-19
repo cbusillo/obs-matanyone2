@@ -88,6 +88,7 @@ void filter_defaults(obs_data_t *settings) {
     obs_data_set_default_string(settings, "edge_refinement", "bilateral");
     obs_data_set_default_double(settings, "edge_offset", 0.0);
     obs_data_set_default_double(settings, "temporal_smoothing", 0.0);
+    obs_data_set_default_double(settings, "alpha_hardness", 0.0);
     obs_data_set_default_string(settings, "alignment", "aligned");
     obs_data_set_default_string(settings, "compute_units", "cpu_ane");
     obs_data_set_default_int(settings, "max_matte_fps", 0);
@@ -116,6 +117,7 @@ void filter_update(void *data, obs_data_t *settings) {
     options.edge_offset_px = static_cast<float>(obs_data_get_double(settings, "edge_offset"));
     options.temporal_smoothing =
         static_cast<float>(obs_data_get_double(settings, "temporal_smoothing"));
+    options.alpha_hardness = static_cast<float>(obs_data_get_double(settings, "alpha_hardness"));
     options.speck_filter = obs_data_get_bool(settings, "speck_filter");
     options.verbose_logging = obs_data_get_bool(settings, "verbose_logging");
     const int compute_units =
@@ -287,6 +289,9 @@ obs_properties_t *filter_properties(void *data) {
     p = obs_properties_add_float_slider(quality, "temporal_smoothing", T("TemporalSmoothing"), 0.0,
                                         0.9, 0.05);
     describe(p, "TemporalSmoothing.Description");
+    p = obs_properties_add_float_slider(quality, "alpha_hardness", T("AlphaHardness"), 0.0, 1.0,
+                                        0.05);
+    describe(p, "AlphaHardness.Description");
     p = obs_properties_add_list(quality, "alignment", T("Alignment"), OBS_COMBO_TYPE_LIST,
                                 OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(p, T("Alignment.LowestLatency"), "lowest_latency");

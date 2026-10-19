@@ -11,6 +11,10 @@ public struct PostprocessOptions: Equatable, Sendable {
     public var temporalSmoothing: Float = 0
     /// Negative erodes, positive feathers, in working-resolution pixels.
     public var edgeOffsetPixels: Float = 0
+    /// 0 = off. Higher values push uncertain alpha toward fully opaque or
+    /// fully clear, so soft areas such as hair render solid instead of
+    /// see-through. The pivot sits below one half to favour keeping them.
+    public var alphaHardness: Float = 0
 
     public init() {}
 }
@@ -22,7 +26,8 @@ public struct PostprocessTimings: Equatable, Sendable {
 }
 
 /// Turns the engine's float alpha into the 8-bit matte the renderer uploads.
-/// Stages, in order: speck filter, temporal EMA, quantize, erode or feather.
+/// Stages, in order: speck filter, temporal EMA, hardness, quantize, erode or
+/// feather.
 public final class Postprocessor {
     public let width: Int
     public let height: Int
@@ -65,6 +70,10 @@ public final class Postprocessor {
         smoother.apply(&alpha)
         timings.smoothMs = ms(clock.now - tSmooth)
 
+        if options.alphaHardness > 0 {
+            Self.harden(&alpha, hardness: min(options.alphaHardness, 1))
+        }
+
         vDSP.multiply(255, alpha, result: &scaled)
         vDSP.clip(scaled, to: 0...255, result: &scaled)
         vDSP.convertElements(of: scaled, to: &matte, rounding: .towardNearestInteger)
@@ -80,6 +89,17 @@ public final class Postprocessor {
             timings.edgeMs = ms(clock.now - t)
         }
         return timings
+    }
+
+    /// Smoothstep across a window centred on `pivot` whose width shrinks
+    /// from 1 to 0.05 as hardness goes from 0 to 1.
+    static func harden(_ alpha: inout [Float], hardness: Float, pivot: Float = 0.4) {
+        let width = max(0.05, 1 - hardness)
+        let low = pivot - width / 2
+        for i in alpha.indices {
+            let t = min(max((alpha[i] - low) / width, 0), 1)
+            alpha[i] = t * t * (3 - 2 * t)
+        }
     }
 
     private func ms(_ d: Duration) -> Double {

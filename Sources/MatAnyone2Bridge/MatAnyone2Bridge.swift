@@ -147,6 +147,7 @@ public func ma2SetOptions(
     worker.maxMatteFPS = Int(o.max_matte_fps)
     worker.postprocess.edgeOffsetPixels = o.edge_offset_px
     worker.postprocess.temporalSmoothing = o.temporal_smoothing
+    worker.postprocess.alphaHardness = o.alpha_hardness
     worker.postprocess.speckFilterEnabled = o.speck_filter
     worker.verboseLogging = o.verbose_logging
     context.worker.setOptions(worker)

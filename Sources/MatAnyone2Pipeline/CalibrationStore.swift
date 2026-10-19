@@ -12,6 +12,10 @@ public struct CalibrationData: Equatable, Sendable {
     public var cleanPlate: Plate?
     public var propsPlate: Plate?
     public var propsMask: Mask?
+    /// Optional hand-made mask of areas always kept in the matte (for
+    /// example a desk in front of the person). Read from keep-mask.png;
+    /// never written by calibration and kept when calibration is cleared.
+    public var keepMask: Mask?
     public var propsRegions: Int
     public var threshold: Int
     public var minRegion: Int
@@ -60,6 +64,7 @@ public struct CalibrationStore: Sendable {
     private var cleanURL: URL { directory.appendingPathComponent("clean-plate.png") }
     private var propsURL: URL { directory.appendingPathComponent("props-plate.png") }
     private var maskURL: URL { directory.appendingPathComponent("props-mask.png") }
+    private var keepURL: URL { directory.appendingPathComponent("keep-mask.png") }
 
     /// nil when nothing is stored; throws when the stored resolution differs.
     public func load(workingWidth: Int, workingHeight: Int) throws -> CalibrationData? {
@@ -76,6 +81,7 @@ public struct CalibrationStore: Sendable {
         data.cleanPlate = try Self.readPlate(cleanURL, width: workingWidth, height: workingHeight)
         data.propsPlate = try Self.readPlate(propsURL, width: workingWidth, height: workingHeight)
         data.propsMask = try Self.readMask(maskURL, width: workingWidth, height: workingHeight)
+        data.keepMask = try Self.readMask(keepURL, width: workingWidth, height: workingHeight)
         return data
     }
 
@@ -94,9 +100,17 @@ public struct CalibrationStore: Sendable {
     }
 
     public func clear() throws {
-        if FileManager.default.fileExists(atPath: directory.path) {
-            try FileManager.default.removeItem(at: directory)
+        guard FileManager.default.fileExists(atPath: directory.path) else { return }
+        for url in try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil)
+        where url.lastPathComponent != keepURL.lastPathComponent {
+            try FileManager.default.removeItem(at: url)
         }
+    }
+
+    /// The hand-made keep mask alone, so it survives a cleared calibration.
+    public func loadKeepMask(workingWidth: Int, workingHeight: Int) -> Mask? {
+        try? Self.readMask(keepURL, width: workingWidth, height: workingHeight)
     }
 
     // MARK: PNG
